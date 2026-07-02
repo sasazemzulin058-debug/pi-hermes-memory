@@ -17,7 +17,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { moveFileSafe } from "./atomic-write.js";
 import { scanContent } from "./content-scanner.js";
-import { normalizeMemoryLookupText } from "./memory-lookup.js";
+import { memoryLookupCandidates } from "./memory-lookup.js";
 import {
   ENTRY_DELIMITER,
   DEFAULT_MEMORY_CHAR_LIMIT,
@@ -29,6 +29,10 @@ import {
   USER_FILE,
 } from "../constants.js";
 import type { MemoryConfig, MemoryResult, ConsolidationResult, MemoryCategory } from "../types.js";
+
+type MatchResult =
+  | { ok: true; idx: number; entry: string }
+  | { ok: false; error: string; matches?: string[] };
 
 export class MemoryStore {
   private memoryEntries: string[] = [];
@@ -207,30 +211,25 @@ export class MemoryStore {
   }
 
   async replace(target: "memory" | "user" | "failure", oldText: string, newContent: string): Promise<MemoryResult> {
-    oldText = normalizeMemoryLookupText(oldText);
+    const candidates = memoryLookupCandidates(oldText);
+    if (candidates.length === 0) return { success: false, error: "old_text cannot be empty." };
     newContent = newContent.trim();
-    if (!oldText) return { success: false, error: "old_text cannot be empty." };
     if (!newContent) return { success: false, error: "new_content cannot be empty. Use 'remove' to delete entries." };
 
     const scanError = scanContent(newContent);
     if (scanError) return { success: false, error: scanError };
 
-    const entries = this.entriesFor(target);
-    // Match against stripped text (entries may have metadata comments)
-    const matches = entries.filter((e) => this.stripMetadata(e).includes(oldText));
-
-    if (matches.length === 0) return { success: false, error: `No entry matched '${oldText}'.` };
-    if (matches.length > 1 && new Set(matches).size > 1) {
-      return {
-        success: false,
-        error: `Multiple entries matched '${oldText}'. Be more specific.`,
-        matches: matches.map((e) => this.stripMetadata(e).slice(0, 80) + (e.length > 80 ? "..." : "")),
-      };
+    const found = this.findMatch(target, oldText, candidates);
+    if (!found.ok) {
+      const err: MemoryResult = { success: false, error: found.error };
+      if (found.matches) err.matches = found.matches;
+      return err;
     }
 
-    const idx = entries.indexOf(matches[0]);
+    const entries = this.entriesFor(target);
+    const idx = found.idx;
     // Preserve original created date, refs, and domain; update last_referenced to today
-    const decoded = this.decodeEntry(matches[0]);
+    const decoded = this.decodeEntry(found.entry);
     const today = new Date().toISOString().split("T")[0];
     const encoded = this.encodeEntry(newContent, decoded.created, today, decoded.refs, decoded.domain);
 
@@ -253,32 +252,56 @@ export class MemoryStore {
   }
 
   async remove(target: "memory" | "user" | "failure", oldText: string): Promise<MemoryResult> {
-    oldText = normalizeMemoryLookupText(oldText);
-    if (!oldText) return { success: false, error: "old_text cannot be empty." };
+    const candidates = memoryLookupCandidates(oldText);
+    if (candidates.length === 0) return { success: false, error: "old_text cannot be empty." };
 
-    const entries = this.entriesFor(target);
-    // Match against stripped text — entries carry metadata comments that the
-    // user never sees, and a pasted memory_search line has a leading prefix.
-    const matches = entries.filter((e) => this.stripMetadata(e).includes(oldText));
-
-    if (matches.length === 0) return { success: false, error: `No entry matched '${oldText}'.` };
-    if (matches.length > 1 && new Set(matches).size > 1) {
-      return {
-        success: false,
-        error: `Multiple entries matched '${oldText}'. Be more specific.`,
-        matches: matches.map((e) => {
-          const stripped = this.stripMetadata(e);
-          return stripped.slice(0, 80) + (stripped.length > 80 ? "..." : "");
-        }),
-      };
+    const found = this.findMatch(target, oldText, candidates);
+    if (!found.ok) {
+      const err: MemoryResult = { success: false, error: found.error };
+      if (found.matches) err.matches = found.matches;
+      return err;
     }
 
-    const idx = entries.indexOf(matches[0]);
-    entries.splice(idx, 1);
+    const entries = this.entriesFor(target);
+    entries.splice(found.idx, 1);
     this.setEntries(target, entries);
     await this.saveToDisk(target);
 
     return this.successResponse(target, "Entry removed.");
+  }
+
+  /**
+   * Find the single entry whose stored body contains a pasted memory_search
+   * line. Tries each candidate (most-specific first: with the `[category]`
+   * label, then without it) because memory_search prepends a category label
+   * that is render-only for memory/user targets. The first candidate yielding
+   * exactly one distinct match wins; >1 distinct is ambiguous; 0 across all
+   * candidates is a miss.
+   */
+  private findMatch(target: "memory" | "user" | "failure", oldText: string, candidates: string[]): MatchResult {
+    const entries = this.entriesFor(target);
+    let ambiguousMatches: string[] | undefined;
+
+    for (const cand of candidates) {
+      const matches = entries.filter((e) => this.stripMetadata(e).includes(cand));
+      const distinct = new Set(matches);
+      if (distinct.size === 1) {
+        return { ok: true, idx: entries.indexOf(matches[0]), entry: matches[0] };
+      }
+      if (distinct.size > 1) {
+        // Broader candidates can only match a superset, so stop here.
+        ambiguousMatches = matches.map((e) => {
+          const stripped = this.stripMetadata(e);
+          return stripped.slice(0, 80) + (stripped.length > 80 ? "..." : "");
+        });
+        break;
+      }
+    }
+
+    if (ambiguousMatches) {
+      return { ok: false, error: `Multiple entries matched '${oldText}'. Be more specific.`, matches: ambiguousMatches };
+    }
+    return { ok: false, error: `No entry matched '${oldText}'.` };
   }
 
   // ─── System prompt injection (ranked selection with hybrid scoring) ───

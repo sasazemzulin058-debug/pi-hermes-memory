@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeMemoryLookupText } from '../../src/store/memory-lookup.js';
+import { normalizeMemoryLookupText, memoryLookupCandidates } from '../../src/store/memory-lookup.js';
 
 describe('normalizeMemoryLookupText', () => {
   it('returns empty string for empty/whitespace input', () => {
@@ -63,5 +63,36 @@ describe('normalizeMemoryLookupText', () => {
 
   it('returns empty for whitespace-only after trimming', () => {
     assert.equal(normalizeMemoryLookupText('   \n\t  '), '');
+  });
+});
+
+describe('memoryLookupCandidates', () => {
+  it('returns an empty array for empty/whitespace input', () => {
+    assert.deepEqual(memoryLookupCandidates(''), []);
+    assert.deepEqual(memoryLookupCandidates('   '), []);
+  });
+
+  it('returns the normalized line as the sole candidate when there is no leading [category] tag', () => {
+    assert.deepEqual(
+      memoryLookupCandidates('🧠 [global] prefers pnpm over npm'),
+      ['prefers pnpm over npm'],
+    );
+  });
+
+  it('adds a second candidate with the leading [category] tag stripped (memory/user target)', () => {
+    // memory_search renders `🧠 [global] [tool-quirk] <content>` for a memory
+    // entry that carries a category. The flat-file body has no [tool-quirk], so
+    // the primary candidate won't match — the stripped candidate must.
+    const cands = memoryLookupCandidates('🧠 [global] [tool-quirk] Pi sandbox quirks');
+    assert.equal(cands[0], '[tool-quirk] Pi sandbox quirks');
+    assert.equal(cands[1], 'Pi sandbox quirks');
+  });
+
+  it('keeps the [category] tag on the primary candidate for failure entries', () => {
+    // Failure bodies DO store the [category] tag, so the primary candidate
+    // (with the tag) matches; the stripped form is offered only as a fallback.
+    const cands = memoryLookupCandidates('⚠️ [global] [correction] retry with --force');
+    assert.equal(cands[0], '[correction] retry with --force');
+    assert.ok(cands.includes('retry with --force'));
   });
 });

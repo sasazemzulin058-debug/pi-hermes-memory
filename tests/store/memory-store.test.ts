@@ -450,6 +450,45 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.equal(result.entry_count, 0);
     });
 
+    it("matches a pasted line whose [category] label is render-only (memory target with a category)", async () => {
+      // memory_search renders `🧠 [global] [tool-quirk] <content>` for a memory
+      // entry that carries a category, but the flat-file body stores only
+      // <content> (no [tool-quirk]). The stripped candidate must match.
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+
+      await store.add("memory", `${TEST_MARKER} sandbox quirks list`);
+      await settle();
+
+      const pasted = `🧠 [global] [tool-quirk] ${TEST_MARKER} sandbox quirks list`;
+      const result = await store.replace("memory", pasted, `${TEST_MARKER} sandbox quirks v2`);
+      await settle();
+
+      assert.ok(result.success, `expected success, got: ${result.error}`);
+      const raw = await readRaw(memoryPath);
+      assert.ok(!raw.includes(`${TEST_MARKER} sandbox quirks list`));
+      assert.ok(raw.includes(`${TEST_MARKER} sandbox quirks v2`));
+    });
+
+    it("removes an entry via a pasted line whose [category] label is render-only", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+
+      await store.add("memory", `${TEST_MARKER} to remove`);
+      await store.add("memory", `${TEST_MARKER} to keep`);
+      await settle();
+
+      const pasted = `🧠 [global] [tool-quirk] ${TEST_MARKER} to remove`;
+      const result = await store.remove("memory", pasted);
+      await settle();
+
+      assert.ok(result.success, `expected success, got: ${result.error}`);
+      assert.equal(result.entry_count, 1);
+      const raw = await readRaw(memoryPath);
+      assert.ok(!raw.includes(`${TEST_MARKER} to remove`));
+      assert.ok(raw.includes(`${TEST_MARKER} to keep`));
+    });
+
     it("returns the failure-memory preview stripped of metadata in the multiple-match error", async () => {
       const store = new MemoryStore(makeConfig());
       await store.loadFromDisk();
