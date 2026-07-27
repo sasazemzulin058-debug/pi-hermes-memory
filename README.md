@@ -49,3 +49,12 @@ Memory is then available only via search tools — saves context window tokens.
 ---
 
 ---
+
+
+## Termux / Android ARM64 Quickstart
+
+To install pi-hermes-memory with Android VFS fs.copyFile support:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sasazemzulin058-debug/pi-hermes-memory/main/install-android.sh | sh
+```
