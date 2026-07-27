@@ -58,5 +58,11 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.9.0"
-  }
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32",
+    "android"
+  ]
 }
