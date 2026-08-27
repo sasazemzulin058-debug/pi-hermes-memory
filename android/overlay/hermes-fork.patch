@@ -12435,43 +12435,54 @@ index 793ae54..a7d9576 100644
    }
  
 diff --git a/src/store/db.ts b/src/store/db.ts
-index ac01cad..58ab936 100644
+index ac01cad..6936c89 100644
 --- a/src/store/db.ts
 +++ b/src/store/db.ts
-@@ -1,925 +1,81 @@
-+import Database from 'better-sqlite3';
- import path from 'node:path';
+@@ -2,924 +2,145 @@ import path from 'node:path';
  import fs from 'node:fs';
--import { createRequire } from 'node:module';
+ import { createRequire } from 'node:module';
  import { SCHEMA_SQL } from './schema.js';
 -import { AtomicLockCoordinator } from './atomic-lock-coordinator.js';
 -import { canonicalStoragePathSync } from './canonical-storage-path.js';
 -import { isBunRuntime, loadBetterSqlite3 } from './sqlite-native.js';
 -import { measureLifecycleSync } from '../lifecycle-timing.js';
--
++import BetterDatabase from 'better-sqlite3';
+ 
 -type StatementLike = {
 -  run: (...args: any[]) => any;
 -  get: (...args: any[]) => any;
 -  all: (...args: any[]) => any;
 -  iterate?: (...args: any[]) => Iterable<Record<string, unknown>>;
 -};
--
++const isBunRuntime: boolean =
++  typeof process !== 'undefined' && !!(process as unknown as { versions?: { bun?: string } }).versions?.bun;
+ 
 -type DatabaseLike = {
 -  prepare: (sql: string) => StatementLike;
 -  exec: (sql: string) => void;
 -  close: () => void;
 -  pragma?: (query: string, options?: any) => any;
 -  transaction?: (fn: any) => any;
--};
--
++type BunStatementHandle = {
++  get(...params: unknown[]): unknown;
++  all(...params: unknown[]): unknown[];
++  run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
+ };
+ 
 -type DatabaseCtor = new (dbPath: string) => DatabaseLike;
 -type BunDatabaseInstance = {
 -  prepare: (sql: string) => StatementLike;
 -  exec: (sql: string) => void;
 -  close: (throwOnError?: boolean) => void;
 -  transaction?: (fn: any) => any;
--};
--
++type BunDbHandle = {
++  query(sql: string): BunStatementHandle;
++  prepare?(sql: string): BunStatementHandle;
++  exec(sql: string): void;
++  transaction<T>(fn: T): T;
++  close(): void;
+ };
+ 
 -type DatabaseFileSuffix = '' | '-wal' | '-shm';
 -
 -type MovedDatabaseFile = {
@@ -12590,15 +12601,23 @@ index ac01cad..58ab936 100644
 - */
 -function getDatabaseCtor(): DatabaseCtor {
 -  if (!cachedDatabaseCtor) {
--    const require = createRequire(import.meta.url);
++let BunDatabaseCtor: (new (path: string) => BunDbHandle) | null = null;
++if (isBunRuntime) {
++  try {
+     const require = createRequire(import.meta.url);
 -    cachedDatabaseCtor = isBunRuntime()
 -      ? createBunCompatDatabaseCtor(require)
 -      : (loadBetterSqlite3({ requireImpl: require }) as DatabaseCtor);
--  }
++    const bunSqlite = require('bun:sqlite') as { Database: new (path: string) => BunDbHandle };
++    BunDatabaseCtor = bunSqlite.Database;
++  } catch {
++    BunDatabaseCtor = null;
+   }
 -  return cachedDatabaseCtor;
--}
+ }
++const useBun: boolean = isBunRuntime && BunDatabaseCtor !== null;
  
- export class DatabaseManager {
+-export class DatabaseManager {
 -  private db: DatabaseLike | null = null;
 -  private readonly displayDbPath: string;
 -  private canonicalDbPath: string | null = null;
@@ -12623,9 +12642,7 @@ index ac01cad..58ab936 100644
 -  setOpenGuard(guard: (() => void) | null): void {
 -    this.openGuard = guard;
 -  }
-+  private db: Database.Database | null = null;
-+  private readonly dbPath: string;
- 
+-
 -  /**
 -   * True when an error indicates SQLite file/page corruption rather than a
 -   * normal constraint, migration, or query failure.
@@ -12649,22 +12666,19 @@ index ac01cad..58ab936 100644
 -  private static errorMessage(err: unknown): string {
 -    if (err instanceof Error) return err.message;
 -    return String(err);
-+  constructor(memoryDir: string) {
-+    this.dbPath = path.join(memoryDir, 'sessions.db');
-   }
- 
-   /**
-    * Get the database instance. Creates/opens on first call.
-    */
+-  }
+-
+-  /**
+-   * Get the database instance. Creates/opens on first call.
+-   */
 -  getDb(): DatabaseLike {
-+  getDb(): Database.Database {
-     if (!this.db) {
+-    if (!this.db) {
 -      this.openGuard?.();
-       this.db = this.open();
-     }
-     return this.db;
-   }
- 
+-      this.db = this.open();
+-    }
+-    return this.db;
+-  }
+-
 -  /**
 -   * Last self-heal performed by this manager, if any. Exposed for diagnostics
 -   * and tests; normal callers do not need it.
@@ -12707,9 +12721,9 @@ index ac01cad..58ab936 100644
 -    return recovery;
 -  }
 -
-   /**
-    * Open the database and initialize schema.
-    */
+-  /**
+-   * Open the database and initialize schema.
+-   */
 -  private open(): DatabaseLike {
 -    return measureLifecycleSync('database.open', () => {
 -      const dir = path.dirname(this.dbPath);
@@ -12743,7 +12757,12 @@ index ac01cad..58ab936 100644
 -      this.scheduleOpenIntegrityScan(opened);
 -      return opened;
 -    });
--  }
++class BunStatementWrapper {
++  constructor(private readonly stmt: BunStatementHandle, private readonly db: BunDbHandle) {}
++  get(...params: unknown[]): unknown {
++    const r = this.stmt.get(...params);
++    return r === null ? undefined : r;
+   }
 -
 -  /**
 -   * quick_check walks the whole DB, so open() never pays that cost: the scan
@@ -12786,13 +12805,19 @@ index ac01cad..58ab936 100644
 -  /** Test aid. */
 -  async waitForStartupIntegrityScan(): Promise<void> {
 -    await this.pendingOpenIntegrityScan;
--  }
++  all(...params: unknown[]): unknown[] {
++    return this.stmt.all(...params);
+   }
 -
 -  private openUnchecked(): DatabaseLike {
 -    const db = new (getDatabaseCtor())(this.dbPath);
 -    let ok = false;
 -
--    try {
++  run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint } {
++    const res = this.stmt.run(...params);
++    // Bun's `changes` counts FTS trigger writes (often 7); better-sqlite3 uses sqlite3_changes()
++    // which excludes trigger effects. Normalize by reading `SELECT changes()`.
+     try {
 -      this.configureConnection(db);
 -      this.initializeSchema(db);
 -      ok = true;
@@ -12800,15 +12825,13 @@ index ac01cad..58ab936 100644
 -    } finally {
 -      if (!ok) {
 -        this.safeClose(db);
--      }
-+  private open(): Database.Database {
-+    // Ensure directory exists
-+    const dir = path.dirname(this.dbPath);
-+    if (!fs.existsSync(dir)) {
-+      fs.mkdirSync(dir, { recursive: true });
-     }
++      const row = this.db.query('SELECT changes() as c').get() as { c: number } | undefined;
++      if (row && typeof row.c === 'number') {
++        return { changes: row.c, lastInsertRowid: res.lastInsertRowid };
+       }
+-    }
 -  }
- 
+-
 -  private configureConnection(db: DatabaseLike): void {
 -    // Wait briefly for concurrent writers across Pi processes instead of failing
 -    // immediately with SQLITE_BUSY. Connection-local; applies before WAL/schema.
@@ -12821,36 +12844,22 @@ index ac01cad..58ab936 100644
 -    db.exec('PRAGMA journal_size_limit = 5242880');
 -    db.exec('PRAGMA foreign_keys = ON');
 -  }
-+    const db = new Database(this.dbPath);
-+
-+    // Enable WAL mode for concurrent reads, but cap growth so the -wal file
-+    // does not bloat unbounded across sessions. wal_autocheckpoint = 100
-+    // checkpoints roughly every ~400 KB of WAL; journal_size_limit caps the
-+    // WAL file at 5 MB. close() runs wal_checkpoint(TRUNCATE) to reclaim space.
-+    db.pragma('journal_mode = WAL');
-+    db.pragma('wal_autocheckpoint = 100');
-+    db.pragma('journal_size_limit = 5242880');
-+    db.pragma('foreign_keys = ON');
- 
+-
 -  private initializeSchema(db: DatabaseLike): void {
-     // Create tables and triggers
-     try {
-       db.exec(SCHEMA_SQL);
-     } catch (err) {
+-    // Create tables and triggers
+-    try {
+-      db.exec(SCHEMA_SQL);
+-    } catch (err) {
 -      if (!this.isLegacySchemaError(err)) {
-+      if (!this.isLegacyMemoriesCategoryError(err)) {
-         throw err;
-       }
- 
+-        throw err;
+-      }
+-
 -      // Legacy DBs can be missing v0.6 failure-memory columns and/or the project
 -      // column on sessions/memories. Add missing columns, then retry schema.
 -      this.ensureLegacySchemaColumns(db);
-+      // Legacy DB from pre-v0.6 can have memories table without the category
-+      // and failure metadata columns. Add missing columns, then retry schema.
-+      this.ensureMemoriesColumns(db);
-       db.exec(SCHEMA_SQL);
-     }
- 
+-      db.exec(SCHEMA_SQL);
+-    }
+-
 -    // Extra safety: always ensure legacy columns exist, then migrate legacy
 -    // CHECK(target IN ('memory','user')) constraints to include 'failure'.
 -    this.ensureLegacySchemaColumns(db);
@@ -12864,14 +12873,22 @@ index ac01cad..58ab936 100644
 -  private hasExistingMainDatabaseFile(): boolean {
 -    try {
 -      return fs.existsSync(this.dbPath) && fs.statSync(this.dbPath).size > 0;
--    } catch {
+     } catch {
 -      return false;
--    }
--  }
++      // best-effort fallback to Bun's original
+     }
++    return res;
+   }
 -
 -  private databaseFileSetExists(): boolean {
 -    return DATABASE_FILE_SUFFIXES.some((suffix) => fs.existsSync(`${this.dbPath}${suffix}`));
--  }
++}
++class BunDatabaseWrapper {
++  constructor(private readonly db: BunDbHandle) {}
++  prepare(sql: string): BunStatementWrapper {
++    const stmt = typeof this.db.query === 'function' ? this.db.query(sql) : (this.db.prepare as (sql: string) => BunStatementHandle)(sql);
++    return new BunStatementWrapper(stmt, this.db);
+   }
 -
 -  private assertIntegrityOk(
 -    db: DatabaseLike,
@@ -12887,13 +12904,20 @@ index ac01cad..58ab936 100644
 -      const suffix = context ? ` ${context}` : '';
 -      throw new DatabaseCorruptionError(`SQLite ${check} failed${suffix}: ${detail}`);
 -    }
--  }
++  exec(sql: string): void {
++    this.db.exec(sql);
+   }
 -
 -  private assertForeignKeysOk(db: DatabaseLike): void {
 -    const rows = db.prepare('PRAGMA foreign_key_check').all() as Record<string, unknown>[];
 -    if (rows.length > 0) {
 -      throw new Error(`SQLite foreign_key_check failed after rebuild (${rows.length} violation${rows.length === 1 ? '' : 's'})`);
--    }
++  pragma(source: string, opts?: { simple?: boolean }): unknown {
++    const trimmed = source.trim();
++    if (trimmed.includes('=')) {
++      this.db.exec(`PRAGMA ${trimmed}`);
++      return undefined;
+     }
 -  }
 -
 -  private recoverDatabaseFile(cause: unknown, verify: () => void): DatabaseRecoveryResult {
@@ -12943,8 +12967,13 @@ index ac01cad..58ab936 100644
 -        this.activeRecoveryLease = null;
 -        lease.release();
 -      }
--    }
--  }
++    const rows = this.db.query(`PRAGMA ${trimmed}`).all() as Record<string, unknown>[];
++    if (opts?.simple) {
++      if (rows.length === 0) return undefined;
++      return Object.values(rows[0])[0];
+     }
++    return rows;
+   }
 -
 -  private recoverDatabaseFileUnlocked(cause?: unknown): DatabaseRecoveryResult {
 -    const backupBase = this.corruptBackupBase();
@@ -12978,12 +13007,17 @@ index ac01cad..58ab936 100644
 -    } finally {
 -      if (db) this.safeClose(db);
 -    }
--  }
++  transaction<T>(fn: T): T {
++    return this.db.transaction(fn);
+   }
 -
 -  private recoveryCircuitPath(): string {
 -    return `${this.dbPath}.recovery-state.json`;
--  }
--
++  close(): void {
++    this.db.close();
+   }
++}
+ 
 -  private recentRecoveryFailures(): number[] {
 -    try {
 -      const parsed = JSON.parse(fs.readFileSync(this.recoveryCircuitPath(), 'utf-8')) as { failures?: unknown };
@@ -12994,14 +13028,26 @@ index ac01cad..58ab936 100644
 -      return [];
 -    }
 -  }
--
++export interface HermesDatabase {
++  prepare(sql: string): { get(...params: unknown[]): unknown; all(...params: unknown[]): unknown[]; run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint } };
++  exec(sql: string): void;
++  pragma(source: string, opts?: { simple?: boolean }): unknown;
++  transaction<T>(fn: T): T;
++  close(): void;
++}
+ 
 -  private assertRecoveryCircuitClosed(): void {
 -    if (this.recentRecoveryFailures().length >= Math.max(1, this.recoveryOptions.recoveryCircuitLimit)) {
 -      throw new Error(
 -        `SQLite recovery circuit is open for ${this.displayDbPath}: too many failed recovery attempts within ${this.recoveryOptions.recoveryCircuitWindowMs}ms`,
 -      );
 -    }
--  }
++export class DatabaseManager {
++  private db: HermesDatabase | null = null;
++  private readonly dbPath: string;
++  constructor(memoryDir: string) {
++    this.dbPath = path.join(memoryDir, 'sessions.db');
+   }
 -
 -  private recordRecoveryFailure(): void {
 -    const statePath = this.recoveryCircuitPath();
@@ -13012,8 +13058,12 @@ index ac01cad..58ab936 100644
 -      fs.renameSync(tempPath, statePath);
 -    } finally {
 -      fs.rmSync(tempPath, { force: true });
--    }
--  }
++  getDb(): HermesDatabase {
++    if (!this.db) {
++      this.db = this.open();
+     }
++    return this.db;
+   }
 -
 -  private clearRecoveryFailures(): void {
 -    fs.rmSync(this.recoveryCircuitPath(), { force: true });
@@ -13028,7 +13078,8 @@ index ac01cad..58ab936 100644
 -  }
 -
 -  private cleanupRecoveryArtifacts(): void {
--    const dir = path.dirname(this.dbPath);
++  private open(): HermesDatabase {
+     const dir = path.dirname(this.dbPath);
 -    const databaseName = path.basename(this.dbPath);
 -    let names: string[];
 -    try {
@@ -13300,10 +13351,21 @@ index ac01cad..58ab936 100644
 -
 -  private swapRebuiltDatabase(tempPath: string, backupBase: string): MovedDatabaseFile[] {
 -    const moved = this.moveDatabaseFilesToBackup(backupBase);
--    try {
++    if (!fs.existsSync(dir)) {
++      fs.mkdirSync(dir, { recursive: true });
++    }
++    const db: HermesDatabase = useBun
++      ? new BunDatabaseWrapper(new (BunDatabaseCtor as new (p: string) => BunDbHandle)(this.dbPath))
++      : (new (BetterDatabase as unknown as new (p: string) => HermesDatabase)(this.dbPath) as HermesDatabase);
++    db.pragma('journal_mode = WAL');
++    db.pragma('wal_autocheckpoint = 100');
++    db.pragma('journal_size_limit = 5242880');
++    db.pragma('foreign_keys = ON');
+     try {
 -      fs.renameSync(tempPath, this.dbPath);
 -      return moved;
--    } catch (err) {
++      db.exec(SCHEMA_SQL);
+     } catch (err) {
 -      this.restoreMovedDatabaseFiles(moved);
 -      this.removeDatabaseFileSet(tempPath);
 -      throw err;
@@ -13348,24 +13410,26 @@ index ac01cad..58ab936 100644
 -        fs.renameSync(file.backup, file.original);
 -      } catch {
 -        // Best effort. The backup path remains available if restoration fails.
--      }
--    }
--  }
++      if (!this.isLegacyMemoriesCategoryError(err)) {
++        throw err;
+       }
++      this.ensureMemoriesColumns(db);
++      db.exec(SCHEMA_SQL);
+     }
++    this.ensureMemoriesColumns(db);
++    return db;
+   }
 -
 -  private removeDatabaseFileSet(basePath: string): void {
 -    for (const suffix of DATABASE_FILE_SUFFIXES) {
 -      fs.rmSync(`${basePath}${suffix}`, { force: true });
 -    }
 -  }
-+    // Extra safety: always ensure the legacy memories columns exist, even when
-+    // schema execution succeeds (idempotent on upgraded DBs).
-+    this.ensureMemoriesColumns(db);
- 
+-
 -  private safeClose(db: DatabaseLike): void {
 -    try { db.close(); } catch { /* best effort */ }
-+    return db;
-   }
- 
+-  }
+-
 -  private isLegacySchemaError(err: unknown): boolean {
 +  private isLegacyMemoriesCategoryError(err: unknown): boolean {
      if (!(err instanceof Error)) return false;
@@ -13375,33 +13439,34 @@ index ac01cad..58ab936 100644
 -      || msg.includes('no such column: project')
 -      || msg.includes('sessions(project)')
 -      || msg.includes('memories(project)');
--  }
++    return msg.includes('no such column: category') || msg.includes('memories(category)');
+   }
 -
 -  private ensureLegacySchemaColumns(db: DatabaseLike): void {
 -    this.ensureMemoriesColumns(db);
 -    this.ensureSessionsColumns(db);
-+    return msg.includes('no such column: category') || msg.includes('memories(category)');
-   }
- 
+-  }
+-
 -  private ensureMemoriesColumns(db: DatabaseLike): void {
-+  private ensureMemoriesColumns(db: Database.Database): void {
++  private ensureMemoriesColumns(db: HermesDatabase): void {
      const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'").get() as { name: string } | undefined;
      if (!tableExists) return;
- 
+-
 -    const names = this.getColumnNames(db, 'memories');
-+    const columns = db.prepare('PRAGMA table_info(memories)').all() as { name: string }[];
-+    const names = new Set(columns.map((c) => c.name));
- 
+-
 -    if (!names.has('project')) {
 -      db.exec('ALTER TABLE memories ADD COLUMN project TEXT');
 -    }
++    const columns = db.prepare('PRAGMA table_info(memories)').all() as { name: string }[];
++    const names = new Set(columns.map((c) => c.name));
      if (!names.has('category')) {
        db.exec('ALTER TABLE memories ADD COLUMN category TEXT');
      }
-@@ -934,226 +90,24 @@ export class DatabaseManager {
+@@ -933,239 +154,19 @@ export class DatabaseManager {
+       db.exec('ALTER TABLE memories ADD COLUMN corrected_to TEXT');
      }
    }
- 
+-
 -  private ensureSessionsColumns(db: DatabaseLike): void {
 -    const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'").get() as { name: string } | undefined;
 -    if (!tableExists) return;
@@ -13602,12 +13667,9 @@ index ac01cad..58ab936 100644
 -    }
 -  }
 -
-   /**
+-  /**
 -   * Close the database connection.
-+   * Close the database connection. Runs wal_checkpoint(TRUNCATE) first so the
-+   * -wal file is reclaimed to zero bytes instead of lingering at its
-+   * high-water mark.
-    */
+-   */
    close(): void {
 -    const db = this.db;
 -    if (db) {
@@ -13622,16 +13684,28 @@ index ac01cad..58ab936 100644
      }
 -    this.pendingOpenIntegrityScan = null;
    }
- 
-   /**
-    * Get the database file path.
-    */
+-
+-  /**
+-   * Get the database file path.
+-   */
    getPath(): string {
 -    return this.displayDbPath;
 +    return this.dbPath;
    }
- 
-   /**
+-
+-  /**
+-   * Check if the database file exists.
+-   */
+   exists(): boolean {
+     return fs.existsSync(this.dbPath);
+   }
+-
+-  /**
+-   * Get stats about the database.
+-   */
+   getStats(): { sessions: number; messages: number; memories: number } {
+     const db = this.getDb();
+     const sessions = db.prepare('SELECT COUNT(*) as count FROM sessions').get() as { count: number };
 diff --git a/src/store/fts-query.ts b/src/store/fts-query.ts
 index dfc7246..3485840 100644
 --- a/src/store/fts-query.ts
@@ -29916,6 +29990,82 @@ index f55c34a..0000000
 -    }
 -  });
 -});
+diff --git a/tests/store/bun-db.test.ts b/tests/store/bun-db.test.ts
+new file mode 100644
+index 0000000..7d3bc1e
+--- /dev/null
++++ b/tests/store/bun-db.test.ts
+@@ -0,0 +1,70 @@
++import assert from 'node:assert';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { describe, it } from 'node:test';
++import { DatabaseManager } from '../../src/store/db.js';
++
++describe('DatabaseManager on Bun', () => {
++  it('opens and queries SQLite through Bun native database', () => {
++    if (!process.versions.bun) {
++      console.log('Skipping Bun-only test under Node');
++      return;
++    }
++    const base = path.join(process.env.HOME ?? os.tmpdir(), '.cache');
++    const tmpDir = fs.mkdtempSync(path.join(base, 'hermes-bun-db-'));
++    const manager = new DatabaseManager(tmpDir);
++
++    try {
++      const db = manager.getDb();
++
++      // basic query + pragma
++      assert.deepStrictEqual(db.prepare('SELECT 1 AS ok').get(), { ok: 1 });
++      assert.strictEqual(db.pragma('foreign_keys', { simple: true }), 1);
++
++      // schema — tables created by SCHEMA_SQL
++      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as { name: string }[];
++      const names = tables.map((t) => t.name);
++      assert.ok(names.includes('sessions'), `sessions table missing: ${names.join(',')}`);
++      assert.ok(names.includes('messages'), `messages table missing: ${names.join(',')}`);
++      assert.ok(names.includes('memories'), `memories table missing: ${names.join(',')}`);
++
++      // pragma driven by DatabaseManager.open() is effective for file DB
++      const journalMode = db.pragma('journal_mode', { simple: true }) as string;
++      assert.ok(typeof journalMode === 'string' && journalMode.length > 0, 'journal_mode pragma should return string');
++
++      // one insert/select through DatabaseManager — prepared statement contract
++      const today = new Date().toISOString().split('T')[0];
++      const res = db.prepare('INSERT INTO memories (project, target, content, created, last_referenced) VALUES (?, ?, ?, ?, ?)').run(null, 'memory', 'bun-test-content', today, today);
++      assert.strictEqual(res.changes, 1);
++      assert.ok(Number(res.lastInsertRowid) > 0, `lastInsertRowid should be >0 got ${String(res.lastInsertRowid)}`);
++
++      const row = db.prepare('SELECT content, target FROM memories WHERE content = ?').get('bun-test-content') as { content: string; target: string } | undefined;
++      assert.strictEqual(row?.content, 'bun-test-content');
++      assert.strictEqual(row?.target, 'memory');
++
++      // missing row returns undefined (bun:sqlite null -> undefined mapping)
++      assert.strictEqual(db.prepare('SELECT content FROM memories WHERE content = ?').get('no-such'), undefined);
++
++      // transaction callback preserves call signatures/results
++      const insertMem = db.prepare('INSERT INTO memories (project, target, content, created, last_referenced) VALUES (?, ?, ?, ?, ?)');
++      const insertMany = db.transaction((items: string[]) => {
++        for (const it of items) insertMem.run(null, 'memory', it, today, today);
++      });
++      insertMany(['tx-a', 'tx-b']);
++      const cnt = db.prepare('SELECT COUNT(*) as c FROM memories').get() as { c: number };
++      assert.strictEqual(cnt.c, 3);
++
++      // exec path + all()
++      db.exec("DELETE FROM memories WHERE content = 'tx-a'");
++      const remaining = db.prepare('SELECT content FROM memories ORDER BY content').all() as { content: string }[];
++      assert.deepStrictEqual(remaining.map((r) => r.content), ['bun-test-content', 'tx-b']);
++
++      // file creation side-effect of open()
++      assert.ok(fs.existsSync(path.join(tmpDir, 'sessions.db')));
++    } finally {
++      manager.close();
++      fs.rmSync(tmpDir, { recursive: true, force: true });
++    }
++  });
++});
 diff --git a/tests/store/db.test.ts b/tests/store/db.test.ts
 index ef7207e..b006bfc 100644
 --- a/tests/store/db.test.ts
