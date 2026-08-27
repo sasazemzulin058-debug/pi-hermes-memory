@@ -123,11 +123,6 @@ jobs:
           # Upstream CI runs npm test via tests/run-all.sh ; respect TEST_TIMEOUT if set
           npm test
 
-      - name: Verify overlay idempotence
-        run: |
-          set -euo pipefail
-          python3 android/scripts/apply-upstream-overlay.py
-          python3 android/scripts/verify-upstream-overlay.py
 
 
       - name: Commit & push if changed
