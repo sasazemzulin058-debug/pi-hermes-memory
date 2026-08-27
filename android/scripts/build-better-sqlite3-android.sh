@@ -182,7 +182,7 @@ echo "$READELF_OUT" | grep -q "Class:.*ELF64" || { echo "error: ELF Class is not
 DEPS="$("$READELF_BIN" -d "$ADDON" 2>&1)"
 echo "$DEPS"
 echo "$DEPS" | grep -q 'Shared library: \[libc.so\]' || { echo "error: addon lacks Android libc.so dependency" >&2; exit 1; }
-echo "$DEPS" | grep -q 'Shared library: \[liblog.so\]' || { echo "error: addon lacks Android liblog.so dependency" >&2; exit 1; }
+echo "$DEPS" | grep -q 'Shared library: \[libc++_shared.so\]' || { echo "error: addon lacks Android libc++_shared.so dependency" >&2; exit 1; }
 echo "    OK: readelf confirms Android/Bionic ELF64 AArch64 addon"
 
  # === Package artifact with checksum and metadata ===

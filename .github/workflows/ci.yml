@@ -143,7 +143,7 @@ jobs:
           grep -q "Class:.*ELF64" /tmp/readelf.txt || { echo "::error::ELF Class not ELF64"; exit 1; }
           "$READELF" -d "$ADDON" | tee /tmp/dynamic.txt
           grep -q 'Shared library: \[libc.so\]' /tmp/dynamic.txt || { echo "::error::missing Android libc.so"; exit 1; }
-          grep -q 'Shared library: \[liblog.so\]' /tmp/dynamic.txt || { echo "::error::missing Android liblog.so"; exit 1; }
+          grep -q 'Shared library: \[libc++_shared.so\]' /tmp/dynamic.txt || { echo "::error::missing Android libc++_shared.so"; exit 1; }
           echo "OK: Android/Bionic ELF64 AArch64 addon"
           echo "=== checksum ==="
           (cd android/build && sha256sum -c better_sqlite3.node.sha256)
