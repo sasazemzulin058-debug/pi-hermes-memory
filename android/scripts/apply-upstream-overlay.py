@@ -57,7 +57,7 @@ def parse_provenance(p: Path) -> dict[str, str]:
     return data
 
 def get_upstream_sha(root: Path) -> str | None:
-    for ref in ["upstream/main", "refs/remotes/upstream/main", "FETCH_HEAD"]:
+    for ref in ["upstream/main", "refs/remotes/upstream/main"]:
         res = run_git(["rev-parse", ref], root)
         if res.returncode==0:
             sha=res.stdout.strip()
