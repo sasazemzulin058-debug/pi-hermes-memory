@@ -1,11 +1,12 @@
 {
   "name": "pi-hermes-memory",
   "version": "0.6.6",
-  "description": "🧠 Persistent memory + 🔍 session search + 🛡️ secret scanning for Pi. SQLite FTS5 search across every conversation, auto-consolidation, memory aging, procedural skills. 272 tests. Ported from Hermes agent.",
+  "description": "Persistent memory and learning loop for Pi and Oh My Pi",
   "type": "module",
   "main": "src/index.ts",
   "files": [
     "src",
+    "index.ts",
     "README.md",
     "LICENSE",
     "docs"
@@ -14,6 +15,16 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "exports": {
+    ".": {
+      "types": "./index.ts",
+      "import": "./index.ts"
+    },
+    "./runtime": {
+      "types": "./src/hermes-runtime.ts",
+      "import": "./src/hermes-runtime.ts"
+    }
   },
   "scripts": {
     "check": "tsc --noEmit",
@@ -30,27 +41,20 @@
     "fts5",
     "skills",
     "learning-loop",
-    "agent",
     "hermes",
-    "secret-scanning",
-    "content-scanner",
-    "correction-detection",
-    "auto-consolidation",
-    "memory-aging",
-    "context-fencing",
-    "two-tier-memory"
+    "secret-scanning"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/chandra447/pi-hermes-memory"
+    "url": "https://github.com/sasazemzulin058-debug/pi-hermes-memory"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.70.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.70.0",
-    "@earendil-works/pi-coding-agent": "^0.70.0",
+    "@earendil-works/pi-ai": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "^0.84.3",
     "@types/better-sqlite3": "^7.6.13",
     "tsx": "^4.21.0",
     "typebox": "^1.1.33",

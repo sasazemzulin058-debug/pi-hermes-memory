@@ -1,3 +1,18 @@
+// Re-export non-Pi runtime factory for OMP `memory.backend: hermes`
+// Keeps Pi default extension intact; OMP imports this named export without
+// triggering Pi tool/command registration.
+export { createHermesMemoryBackend } from "./hermes-runtime.js";
+export type {
+  HermesBackendRuntime,
+  HermesBackendRuntimeOptions,
+  HermesBackendStatus,
+  HermesBackendSearchOptions,
+  HermesBackendSearchResult,
+  HermesBackendSearchItem,
+  HermesBackendSaveInput,
+  HermesBackendSaveResult,
+  HermesExec,
+} from "./hermes-runtime.js";
 /**
  * Pi Hermes Memory Extension
  *
