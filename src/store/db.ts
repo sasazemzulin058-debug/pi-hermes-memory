@@ -1,81 +1,146 @@
-import Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import { SCHEMA_SQL } from './schema.js';
+import BetterDatabase from 'better-sqlite3';
+
+const isBunRuntime: boolean =
+  typeof process !== 'undefined' && !!(process as unknown as { versions?: { bun?: string } }).versions?.bun;
+
+type BunStatementHandle = {
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+  run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
+};
+
+type BunDbHandle = {
+  query(sql: string): BunStatementHandle;
+  prepare?(sql: string): BunStatementHandle;
+  exec(sql: string): void;
+  transaction<T>(fn: T): T;
+  close(): void;
+};
+
+let BunDatabaseCtor: (new (path: string) => BunDbHandle) | null = null;
+if (isBunRuntime) {
+  try {
+    const require = createRequire(import.meta.url);
+    const bunSqlite = require('bun:sqlite') as { Database: new (path: string) => BunDbHandle };
+    BunDatabaseCtor = bunSqlite.Database;
+  } catch {
+    BunDatabaseCtor = null;
+  }
+}
+const useBun: boolean = isBunRuntime && BunDatabaseCtor !== null;
+
+class BunStatementWrapper {
+  constructor(private readonly stmt: BunStatementHandle, private readonly db: BunDbHandle) {}
+  get(...params: unknown[]): unknown {
+    const r = this.stmt.get(...params);
+    return r === null ? undefined : r;
+  }
+  all(...params: unknown[]): unknown[] {
+    return this.stmt.all(...params);
+  }
+  run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint } {
+    const res = this.stmt.run(...params);
+    // Bun's `changes` counts FTS trigger writes (often 7); better-sqlite3 uses sqlite3_changes()
+    // which excludes trigger effects. Normalize by reading `SELECT changes()`.
+    try {
+      const row = this.db.query('SELECT changes() as c').get() as { c: number } | undefined;
+      if (row && typeof row.c === 'number') {
+        return { changes: row.c, lastInsertRowid: res.lastInsertRowid };
+      }
+    } catch {
+      // best-effort fallback to Bun's original
+    }
+    return res;
+  }
+}
+class BunDatabaseWrapper {
+  constructor(private readonly db: BunDbHandle) {}
+  prepare(sql: string): BunStatementWrapper {
+    const stmt = typeof this.db.query === 'function' ? this.db.query(sql) : (this.db.prepare as (sql: string) => BunStatementHandle)(sql);
+    return new BunStatementWrapper(stmt, this.db);
+  }
+  exec(sql: string): void {
+    this.db.exec(sql);
+  }
+  pragma(source: string, opts?: { simple?: boolean }): unknown {
+    const trimmed = source.trim();
+    if (trimmed.includes('=')) {
+      this.db.exec(`PRAGMA ${trimmed}`);
+      return undefined;
+    }
+    const rows = this.db.query(`PRAGMA ${trimmed}`).all() as Record<string, unknown>[];
+    if (opts?.simple) {
+      if (rows.length === 0) return undefined;
+      return Object.values(rows[0])[0];
+    }
+    return rows;
+  }
+  transaction<T>(fn: T): T {
+    return this.db.transaction(fn);
+  }
+  close(): void {
+    this.db.close();
+  }
+}
+
+export interface HermesDatabase {
+  prepare(sql: string): { get(...params: unknown[]): unknown; all(...params: unknown[]): unknown[]; run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint } };
+  exec(sql: string): void;
+  pragma(source: string, opts?: { simple?: boolean }): unknown;
+  transaction<T>(fn: T): T;
+  close(): void;
+}
 
 export class DatabaseManager {
-  private db: Database.Database | null = null;
+  private db: HermesDatabase | null = null;
   private readonly dbPath: string;
-
   constructor(memoryDir: string) {
     this.dbPath = path.join(memoryDir, 'sessions.db');
   }
-
-  /**
-   * Get the database instance. Creates/opens on first call.
-   */
-  getDb(): Database.Database {
+  getDb(): HermesDatabase {
     if (!this.db) {
       this.db = this.open();
     }
     return this.db;
   }
-
-  /**
-   * Open the database and initialize schema.
-   */
-  private open(): Database.Database {
-    // Ensure directory exists
+  private open(): HermesDatabase {
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-
-    const db = new Database(this.dbPath);
-
-    // Enable WAL mode for concurrent reads, but cap growth so the -wal file
-    // does not bloat unbounded across sessions. wal_autocheckpoint = 100
-    // checkpoints roughly every ~400 KB of WAL; journal_size_limit caps the
-    // WAL file at 5 MB. close() runs wal_checkpoint(TRUNCATE) to reclaim space.
+    const db: HermesDatabase = useBun
+      ? new BunDatabaseWrapper(new (BunDatabaseCtor as new (p: string) => BunDbHandle)(this.dbPath))
+      : (new (BetterDatabase as unknown as new (p: string) => HermesDatabase)(this.dbPath) as HermesDatabase);
     db.pragma('journal_mode = WAL');
     db.pragma('wal_autocheckpoint = 100');
     db.pragma('journal_size_limit = 5242880');
     db.pragma('foreign_keys = ON');
-
-    // Create tables and triggers
     try {
       db.exec(SCHEMA_SQL);
     } catch (err) {
       if (!this.isLegacyMemoriesCategoryError(err)) {
         throw err;
       }
-
-      // Legacy DB from pre-v0.6 can have memories table without the category
-      // and failure metadata columns. Add missing columns, then retry schema.
       this.ensureMemoriesColumns(db);
       db.exec(SCHEMA_SQL);
     }
-
-    // Extra safety: always ensure the legacy memories columns exist, even when
-    // schema execution succeeds (idempotent on upgraded DBs).
     this.ensureMemoriesColumns(db);
-
     return db;
   }
-
   private isLegacyMemoriesCategoryError(err: unknown): boolean {
     if (!(err instanceof Error)) return false;
     const msg = err.message.toLowerCase();
     return msg.includes('no such column: category') || msg.includes('memories(category)');
   }
-
-  private ensureMemoriesColumns(db: Database.Database): void {
+  private ensureMemoriesColumns(db: HermesDatabase): void {
     const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'").get() as { name: string } | undefined;
     if (!tableExists) return;
-
     const columns = db.prepare('PRAGMA table_info(memories)').all() as { name: string }[];
     const names = new Set(columns.map((c) => c.name));
-
     if (!names.has('category')) {
       db.exec('ALTER TABLE memories ADD COLUMN category TEXT');
     }
@@ -89,12 +154,6 @@ export class DatabaseManager {
       db.exec('ALTER TABLE memories ADD COLUMN corrected_to TEXT');
     }
   }
-
-  /**
-   * Close the database connection. Runs wal_checkpoint(TRUNCATE) first so the
-   * -wal file is reclaimed to zero bytes instead of lingering at its
-   * high-water mark.
-   */
   close(): void {
     if (this.db) {
       try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best effort */ }
@@ -102,24 +161,12 @@ export class DatabaseManager {
       this.db = null;
     }
   }
-
-  /**
-   * Get the database file path.
-   */
   getPath(): string {
     return this.dbPath;
   }
-
-  /**
-   * Check if the database file exists.
-   */
   exists(): boolean {
     return fs.existsSync(this.dbPath);
   }
-
-  /**
-   * Get stats about the database.
-   */
   getStats(): { sessions: number; messages: number; memories: number } {
     const db = this.getDb();
     const sessions = db.prepare('SELECT COUNT(*) as count FROM sessions').get() as { count: number };
