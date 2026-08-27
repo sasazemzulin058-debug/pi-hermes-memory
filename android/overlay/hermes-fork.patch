@@ -10341,10 +10341,10 @@ index e3fbfaf..e3c3fe6 100644
 
 diff --git a/src/cortex-sync.ts b/src/cortex-sync.ts
 new file mode 100644
-index 0000000..390c09f
+index 0000000..fd869a0
 --- /dev/null
 +++ b/src/cortex-sync.ts
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,80 @@
 +/**
 + * Cortex sync helper for pi-hermes-memory.
 + * Writes durable memory facts into the Cortex Obsidian vault as Markdown pages.
@@ -10386,7 +10386,10 @@ index 0000000..390c09f
 +  domain?: string,
 +): { pagePath: string; isNew: boolean; concept: string } {
 +  if (!fs.existsSync(vaultPath)) {
-+    throw new Error(`Cortex vault not found: ${vaultPath}`);
++    const concept = domain || "general";
++    const type = target === "user" ? "person" : "concept";
++    const pagePath = path.join(vaultPath, "20-Wiki", `${type}s`, `${slugify(concept)}.md`);
++    return { pagePath, isNew: false, concept };
 +  }
 +
 +  const type = target === "user" ? "person" : "concept";

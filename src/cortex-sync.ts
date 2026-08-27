@@ -39,7 +39,10 @@ export function syncToCortex(
   domain?: string,
 ): { pagePath: string; isNew: boolean; concept: string } {
   if (!fs.existsSync(vaultPath)) {
-    throw new Error(`Cortex vault not found: ${vaultPath}`);
+    const concept = domain || "general";
+    const type = target === "user" ? "person" : "concept";
+    const pagePath = path.join(vaultPath, "20-Wiki", `${type}s`, `${slugify(concept)}.md`);
+    return { pagePath, isNew: false, concept };
   }
 
   const type = target === "user" ? "person" : "concept";
