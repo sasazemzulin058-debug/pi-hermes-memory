@@ -21,6 +21,8 @@ Usage:
   python3 android/scripts/apply-upstream-overlay.py [--root <path>] [--check]
 """
 from __future__ import annotations
+import os
+
 import argparse
 import hashlib
 import shutil
@@ -136,8 +138,9 @@ def main() -> int:
         print(f"warning: provenance missing: {provenance}", file=sys.stderr)
         prov = {}
 
-    # Upstream SHA base guard
-    upstream_sha = get_upstream_sha(root)
+    # CI records one immutable upstream SHA before import; do not re-resolve
+    # moving upstream/main between overlay passes.
+    upstream_sha = os.environ.get("upstream_SHA") or get_upstream_sha(root)
     provenance_base = prov.get("upstream_base") or (prov.get("upstream_commit","")[:7] if prov.get("upstream_commit") else "")
     provenance_full = prov.get("upstream_commit","")
     if upstream_sha and provenance_base:
