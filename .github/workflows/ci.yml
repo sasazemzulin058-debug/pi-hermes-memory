@@ -7,6 +7,27 @@ on:
     branches: [main]
 
 jobs:
+  overlay:
+    name: Overlay verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify upstream provenance and overlay idempotence
+        run: |
+          python3 -m py_compile android/scripts/apply-upstream-overlay.py
+          python3 -m py_compile android/scripts/verify-upstream-overlay.py
+          python3 android/scripts/verify-upstream-overlay.py
+          # Ensure fork does not claim clean upstream sync when overlay is absent:
+          # If src/hermes-runtime.ts missing or package exports missing, verification would have failed above.
+          # Also ensure second apply is no-op (verified inside verify script).
+
   check:
     name: Type Check
     runs-on: ubuntu-latest

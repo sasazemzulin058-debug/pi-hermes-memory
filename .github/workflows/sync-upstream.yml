@@ -1,0 +1,93 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # weekly Monday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/chandra447/pi-hermes-memory.git || git remote set-url upstream https://github.com/chandra447/pi-hermes-memory.git
+          git fetch upstream main --prune
+
+      - name: Import upstream tree (preserve .github, android, install script)
+        run: |
+          set -e
+          # Archive upstream main to temp and rsync excluding overlay scaffolding
+          tmp=$(mktemp -d)
+          git archive upstream/main | tar -x -C "$tmp"
+          # rsync upstream into working tree, preserving fork-owned scaffolding
+          rsync -a --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='android' \
+            --exclude='install-android.sh' \
+            --exclude='node_modules' \
+            --exclude='.pi' \
+            "$tmp"/ ./
+          rm -rf "$tmp"
+          echo "import done"
+          git status --porcelain | head -n 50
+
+      - name: Apply overlay
+        run: |
+          set -e
+          python3 android/scripts/apply-upstream-overlay.py
+          python3 android/scripts/verify-upstream-overlay.py
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install (lockfile-consistent)
+        run: |
+          if [ -f package-lock.json ]; then npm ci || npm install; else npm install; fi
+
+      - name: Type check
+        run: npm run check
+
+      - name: Tests (full or focused per upstream CI)
+        run: |
+          # Upstream CI runs npm test via tests/run-all.sh ; respect TEST_TIMEOUT if set
+          npm test
+
+      - name: Verify overlay idempotence
+        run: |
+          python3 android/scripts/apply-upstream-overlay.py
+          python3 android/scripts/verify-upstream-overlay.py
+
+      - name: Commit & push if changed
+        run: |
+          set -e
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # provenance commit message includes upstream commit
+          upstream_sha=$(git rev-parse upstream/main)
+          git add -A
+          git commit -m "chore(sync): mirror upstream ${upstream_sha} + overlay f20e315"
+          git push origin HEAD:main
+
+      - name: Notify conflict
+        if: failure()
+        run: |
+          echo "::error::Sync failed — overlay patch conflict or upstream incompatibility. Check android/overlay/hermes-fork.patch and provenance."
+          echo "Upstream may have changed files touched by overlay; manual rebase of android/overlay/hermes-fork.patch required."

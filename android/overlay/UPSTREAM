@@ -1,0 +1,8 @@
+# Hermes upstream provenance — do not edit manually
+upstream_url=https://github.com/chandra447/pi-hermes-memory.git
+upstream_branch=main
+overlay_format=patch-v1
+overlay_commit=f20e315
+overlay_patch=android/overlay/hermes-fork.patch
+generated_from=upstream/main..f20e315
+overlay_version=1
