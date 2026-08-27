@@ -272,14 +272,14 @@ describe("createHermesMemoryBackend — save/search/status", () => {
     assert.ok(d.includes("Active:"));
   });
 
-  it("beforeAgentStartPrompt and preCompactionContext delegate to instructions", async () => {
+  it("beforeAgentStartPrompt and preCompactionContext avoid duplicate stable injection (return undefined unless query-dependent, flush then undefined)", async () => {
     await rt.save("compaction test — preserve this");
+    const instr = await rt.buildDeveloperInstructions();
+    assert.ok(instr && instr.includes("compaction test"));
     const before = await rt.beforeAgentStartPrompt({}, "hello");
-    assert.ok(before && before.includes("compaction test"));
-
+    assert.equal(before, undefined);
     const pre = await rt.preCompactionContext([], {}, {});
-    assert.ok(pre === undefined || typeof pre === "string");
-    if (pre) assert.ok(pre.length > 0);
+    assert.equal(pre, undefined);
   });
 
   it("clear wipes persisted state", async () => {
@@ -471,7 +471,7 @@ describe("createHermesMemoryBackend — DB availability semantics", () => {
     await removeDir(dir);
   });
 
-  it("clear does not throw when DB unavailable and still clears markdown", async () => {
+  it("clear reports divergent stores via throw and restores markdown when SQLite fails", async () => {
     const dir = await makeTmpDir();
     const rt = createHermesMemoryBackend({ memoryDir: dir, cwd: dir });
     await rt.start();
@@ -482,12 +482,12 @@ describe("createHermesMemoryBackend — DB availability semantics", () => {
       throw new Error("clear db fail");
     } as unknown as typeof orig;
     try {
-      // start already done, now cause status to mark unavailable
       await rt.status();
-      // clear should not throw even though DB fails
-      await rt.clear();
+      await assert.rejects(() => rt.clear(), /clear failed|SQLite error|divergent/);
       const raw = await fs.readFile(path.join(dir, "MEMORY.md"), "utf-8").catch(() => "");
-      assert.equal(raw.trim(), "");
+      assert.ok(raw.includes("to be cleared before db fail"));
+      const st = await rt.status().catch(() => null);
+      if (st) assert.equal(st.active, false);
     } finally {
       (DatabaseManager.prototype as unknown as Record<string, unknown>).getDb = orig as unknown;
       await rt.dispose().catch(() => {});

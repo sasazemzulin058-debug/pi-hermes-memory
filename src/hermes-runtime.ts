@@ -5,7 +5,9 @@
  * slash commands. The caller owns model execution through `exec`.
  * Storage remains caller-selected via memoryDir; no global defaults are forced.
  */
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as fssync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { MemoryStore } from "./store/memory-store.js";
@@ -158,6 +160,22 @@ function memoryConfig(memoryDir: string): MemoryConfig {
   };
 }
 
+
+function stableProjectName(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  const base = path.basename(resolved);
+  if (!base || base === "." || base === "..") return base;
+  // Short hash suffix avoids basename collisions across different parent paths
+  // while keeping human-readable prefix. If the raw cwd is "/" or homedir, caller
+  // already guards with projectStore=null, so hash is only for real projects.
+  const hash = crypto.createHash("sha256").update(resolved).digest("hex").slice(0, 8);
+  return `${base}-${hash}`;
+}
+
+function legacyProjectDir(memoryDir: string, cwd: string): string {
+  return path.join(memoryDir, "projects", path.basename(path.resolve(cwd)));
+}
+
 function parseEntries(text: string): string[] {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1] ?? text;
   const value: unknown = JSON.parse(fenced.trim());
@@ -199,10 +217,28 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
   const session = options.session as { subscribe?: (listener: (event: unknown) => void) => (() => void) | void } | undefined;
   const config = memoryConfig(resolvedMemoryDir);
   const store = new MemoryStore(config);
-  const projectName = path.basename(path.resolve(cwd));
-  const projectDir = path.join(resolvedMemoryDir, "projects", projectName);
+  // Stable project identity: basename + 8-char cwd hash avoids collisions when
+  // two different directories share the same basename (e.g. /a/app vs /b/app).
+  // We keep compatibility with the legacy basename-only dir: if legacy path
+  // exists on disk and the new hashed path does not yet, continue using the
+  // legacy path so existing memories are not orphaned.
+  const resolvedCwd = path.resolve(cwd);
+  const stableName = stableProjectName(cwd);
+  const preferredProjectDir = path.join(resolvedMemoryDir, "projects", stableName);
+  const legacyDir = legacyProjectDir(resolvedMemoryDir, cwd);
+  let projectName = stableName;
+  let projectDir = preferredProjectDir;
+  try {
+    if (fssync.existsSync(legacyDir) && !fssync.existsSync(preferredProjectDir)) {
+      // Legacy data present — keep using it; new writes will go to stable location
+      // only once migration is explicit. For now we stay on legacy to avoid silent split.
+      // Prefer legacy for reads; document divergence if both exist.
+      projectName = path.basename(legacyDir);
+      projectDir = legacyDir;
+    }
+  } catch {}
   const projectStore =
-    path.resolve(cwd) === path.resolve(os.homedir()) || path.resolve(cwd) === "/"
+    resolvedCwd === path.resolve(os.homedir()) || resolvedCwd === "/"
       ? null
       : new MemoryStore({ ...memoryConfig(projectDir), memoryCharLimit: DEFAULT_PROJECT_CHAR_LIMIT });
   let started = false;
@@ -226,6 +262,10 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
   let flushEnabled = false;
   let reviewReason: string | undefined;
   let flushReason: string | undefined;
+  let lastReviewError: string | undefined;
+  let lastFlushError: string | undefined;
+  let startupDivergenceError: string | undefined;
+  let startupDivergenceDetected = false;
 
   function hasSubscribe(): boolean {
     return !!session && typeof (session as { subscribe?: unknown }).subscribe === "function";
@@ -260,7 +300,10 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
         }
       } catch {}
       toolCallsSinceReview += toolCalls;
-      void maybeTriggerReview();
+      void maybeTriggerReview().catch((error) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        lastReviewError = msg;
+      });
     }
     // Flush triggers — support both Pi and OMP naming
     if (
@@ -272,7 +315,10 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
       type === "flush" ||
       (type === "agent_end" && (ev["isTerminal"] === true))
     ) {
-      void doFlush();
+      void doFlush().catch((error) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        lastFlushError = msg;
+      });
     }
   }
 
@@ -288,6 +334,11 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
     reviewInProgress = true;
     try {
       await doBackgroundReview();
+      lastReviewError = undefined;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      lastReviewError = msg;
+      throw error;
     } finally {
       reviewInProgress = false;
     }
@@ -336,24 +387,35 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
     }
     if (entries.length === 0) return;
     for (const entry of entries) {
+      // Snapshot whether entry already existed to avoid removing pre-existing duplicate on rollback
+      const beforeSet = new Set(store.getMemoryEntries());
+      const existedBefore = beforeSet.has(entry);
       try {
         const result = await store.add("memory", entry);
         if (!result.success) continue;
+        const wasDuplicate = existedBefore && result.message?.includes("already exists");
+        // If store reported duplicate without insertion, skip DB mirror (DB dedup will just touch)
+        // but do not attempt rollback removal if DB mirror fails.
+        const inserted = wasDuplicate === false;
         if (dbAvailable && dbManager) {
           try {
             addMemory(dbManager, entry, "memory", null, null, null, null, null);
           } catch (e) {
-            try {
-              await store.remove("memory", entry);
-            } catch {}
+            if (inserted) {
+              try {
+                await store.remove("memory", entry);
+              } catch {}
+            }
             dbAvailable = false;
             dbError = e instanceof Error ? e.message : String(e);
           }
         } else {
-          // DB unavailable — rollback markdown to keep consistency
-          try {
-            await store.remove("memory", entry);
-          } catch {}
+          // DB unavailable — rollback only if we actually inserted
+          if (inserted) {
+            try {
+              await store.remove("memory", entry);
+            } catch {}
+          }
         }
       } catch {}
     }
@@ -369,7 +431,10 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
     let response: string;
     try {
       response = await exec(prompt, { signal, maxTokens: 800 });
-    } catch {
+      lastFlushError = undefined;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      lastFlushError = `flush exec failed: ${msg}`;
       return;
     }
     const trimmed = response.trim();
@@ -390,23 +455,31 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
     }
     if (entries.length === 0) return;
     for (const entry of entries) {
+      const beforeSet = new Set(store.getMemoryEntries());
+      const existedBefore = beforeSet.has(entry);
       try {
         const result = await store.add("memory", entry);
         if (!result.success) continue;
+        const wasDuplicate = existedBefore && result.message?.includes("already exists");
+        const inserted = wasDuplicate === false;
         if (dbAvailable && dbManager) {
           try {
             addMemory(dbManager, entry, "memory", null, null, null, null, null);
           } catch (e) {
-            try {
-              await store.remove("memory", entry);
-            } catch {}
+            if (inserted) {
+              try {
+                await store.remove("memory", entry);
+              } catch {}
+            }
             dbAvailable = false;
             dbError = e instanceof Error ? e.message : String(e);
           }
         } else {
-          try {
-            await store.remove("memory", entry);
-          } catch {}
+          if (inserted) {
+            try {
+              await store.remove("memory", entry);
+            } catch {}
+          }
         }
       } catch {}
     }
@@ -440,6 +513,60 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
       }
     }
     started = true;
+
+    // Startup divergence detection: compare Markdown entries vs indexed SQLite memories
+    // Do not silently reconcile; surface as explicit error for status/diagnose.
+    if (dbAvailable && dbManager) {
+      try {
+        const mdEntries = store.getMemoryEntries();
+        const mdSet = new Set(mdEntries);
+        let dbRows: Array<{ content: string }> = [];
+        try {
+          const db = dbManager.getDb();
+          // Query only memory target, project null — main scope
+          dbRows = db.prepare("SELECT content FROM memories WHERE target='memory' AND project IS NULL").all() as Array<{ content: string }>;
+        } catch {}
+        const dbSet = new Set(dbRows.map((r) => r.content));
+        // Divergence if sets differ (extra in either store) and both stores have had a chance to be populated
+        const onlyInMd = [...mdSet].filter((c) => !dbSet.has(c));
+        const onlyInDb = [...dbSet].filter((c) => !mdSet.has(c));
+        if (onlyInMd.length > 0 || onlyInDb.length > 0) {
+          const sampleMd = onlyInMd.slice(0, 2).map((s) => s.slice(0, 40)).join(", ");
+          const sampleDb = onlyInDb.slice(0, 2).map((s) => s.slice(0, 40)).join(", ");
+          startupDivergenceError = `Markdown/SQLite divergence: ${onlyInMd.length} only in Markdown${sampleMd ? ` (${sampleMd})` : ""}, ${onlyInDb.length} only in SQLite${sampleDb ? ` (${sampleDb})` : ""}`;
+          startupDivergenceDetected = true;
+          // Keep dbAvailable true but surface error via status; also set dbError-like for visibility
+          // Do not overwrite existing dbError, but ensure status reports divergence
+        } else {
+          startupDivergenceError = undefined;
+          startupDivergenceDetected = false;
+        }
+        // Also include project memory check if projectStore exists
+        if (projectStore && !startupDivergenceDetected) {
+          const projMd = projectStore.getMemoryEntries();
+          const projMdSet = new Set(projMd);
+          if (projMd.length > 0 || dbSet.size > 0) {
+            // Project memories in DB have project column = projectName (stable or legacy)
+            let projRows: Array<{ content: string }> = [];
+            try {
+              const db = dbManager.getDb();
+              projRows = db.prepare("SELECT content FROM memories WHERE target='memory' AND project = ?").all(projectName) as Array<{ content: string }>;
+            } catch {}
+            const projDbSet = new Set(projRows.map((r) => r.content));
+            const projOnlyInMd = [...projMdSet].filter((c) => !projDbSet.has(c));
+            const projOnlyInDb = [...projDbSet].filter((c) => !projMdSet.has(c));
+            if (projOnlyInMd.length > 0 || projOnlyInDb.length > 0) {
+              startupDivergenceError = `Markdown/SQLite divergence (project ${projectName}): ${projOnlyInMd.length} only in Markdown, ${projOnlyInDb.length} only in SQLite`;
+              startupDivergenceDetected = true;
+            }
+          }
+        }
+      } catch (error) {
+        // Divergence check is best-effort; do not block startup
+        startupDivergenceError = `divergence check failed: ${error instanceof Error ? error.message : String(error)}`;
+        startupDivergenceDetected = true;
+      }
+    }
 
     // Wire lifecycle if session exposes safe subscribe and exec is available
     const hasSub = hasSubscribe();
@@ -496,20 +623,96 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
 
   async function clear(): Promise<void> {
     await ensureStarted();
-    for (const file of [MEMORY_FILE, USER_FILE, "failures.md"]) {
-      await fs.rm(path.join(resolvedMemoryDir, file), { force: true });
+    // Backup markdown files before deletion for rollback on SQLite failure
+    const memoryFile = path.join(resolvedMemoryDir, MEMORY_FILE);
+    const userFile = path.join(resolvedMemoryDir, USER_FILE);
+    const failuresFile = path.join(resolvedMemoryDir, "failures.md");
+    const projectFile = projectStore ? path.join(projectDir, MEMORY_FILE) : null;
+    const backups = new Map<string, string | null>();
+    for (const p of [memoryFile, userFile, failuresFile, ...(projectFile ? [projectFile] : [])]) {
+      try {
+        backups.set(p, await fs.readFile(p, "utf-8"));
+      } catch {
+        backups.set(p, null);
+      }
     }
-    if (projectStore) await fs.rm(path.join(projectDir, MEMORY_FILE), { force: true });
+    // Also snapshot DB memories for potential restore (not strictly needed for clear rollback)
+    let dbBackup: Array<{ content: string; project: string | null; target: string; category: string | null }> = [];
+    let dbHadData = false;
+    if (dbAvailable && dbManager) {
+      try {
+        const db = dbManager.getDb();
+        dbBackup = db.prepare("SELECT content, project, target, category FROM memories").all() as typeof dbBackup;
+        dbHadData = dbBackup.length > 0;
+      } catch {}
+    }
+
+    let markdownCleared = false;
+    try {
+      for (const file of [MEMORY_FILE, USER_FILE, "failures.md"]) {
+        await fs.rm(path.join(resolvedMemoryDir, file), { force: true });
+      }
+      if (projectStore) await fs.rm(path.join(projectDir, MEMORY_FILE), { force: true });
+      markdownCleared = true;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`Hermes clear failed (markdown): ${msg}`);
+    }
+
     if (dbAvailable && dbManager) {
       try {
         dbManager.getDb().exec("DELETE FROM memories; DELETE FROM messages; DELETE FROM sessions;");
       } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
         dbAvailable = false;
-        dbError = error instanceof Error ? error.message : String(error);
+        dbError = msg;
+        // Rollback markdown to preserve consistency — restore backed-up files
+        if (markdownCleared) {
+          for (const [p, content] of backups) {
+            try {
+              if (content !== null) {
+                await fs.mkdir(path.dirname(p), { recursive: true });
+                await fs.writeFile(p, content, "utf-8");
+              } else {
+                await fs.rm(p, { force: true });
+              }
+            } catch {}
+          }
+          try {
+            await store.loadFromDisk();
+            if (projectStore) await projectStore.loadFromDisk();
+          } catch {}
+        }
+        // Clear divergent flag since we rolled back
+        throw new Error(`Hermes clear failed: SQLite error (${msg}); markdown restored — stores remain consistent`);
       }
+    } else if (!dbAvailable) {
+      // DB unavailable but markdown was cleared — this is divergence; restore markdown and throw
+      const msg = dbError ?? "SQLite unavailable";
+      if (markdownCleared) {
+        for (const [p, content] of backups) {
+          try {
+            if (content !== null) {
+              await fs.mkdir(path.dirname(p), { recursive: true });
+              await fs.writeFile(p, content, "utf-8");
+            } else {
+              await fs.rm(p, { force: true });
+            }
+          } catch {}
+        }
+        try {
+          await store.loadFromDisk();
+          if (projectStore) await projectStore.loadFromDisk();
+        } catch {}
+      }
+      throw new Error(`Hermes clear failed: ${msg}; markdown restored — stores remain consistent`);
     }
+
     await store.loadFromDisk();
     if (projectStore) await projectStore.loadFromDisk();
+    // Reset divergence flag after successful clear
+    startupDivergenceError = undefined;
+    startupDivergenceDetected = false;
     recentMessages = [];
     userTurnCount = 0;
     turnsSinceReview = 0;
@@ -639,6 +842,25 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
     const database = dbManager ? dbManager.getPath() : dbPath;
     const scope = resolvedMemoryDir;
 
+    // Surface startup divergence as inactive even when DB is technically available
+    if (startupDivergenceDetected && startupDivergenceError) {
+      return {
+        backend: "hermes",
+        active: false,
+        writable: false,
+        searchable: false,
+        scope,
+        database,
+        workingCount,
+        lastMemory,
+        message: `Hermes divergence: ${startupDivergenceError}`,
+        error: startupDivergenceError,
+        reviewEnabled,
+        flushEnabled,
+        reviewReason: lastReviewError ?? reviewReason,
+        flushReason: lastFlushError ?? flushReason,
+      };
+    }
     if (!dbAvailable || !dbManager) {
       return {
         backend: "hermes",
@@ -653,13 +875,37 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
         error: dbError ?? "SQLite unavailable",
         reviewEnabled,
         flushEnabled,
-        reviewReason,
-        flushReason,
+        reviewReason: lastReviewError ?? reviewReason,
+        flushReason: lastFlushError ?? flushReason,
       };
     }
     try {
       const db = dbManager.getStats();
       const entries = store.getMemoryEntries();
+      // If divergence was detected post-start, surface it even on otherwise active
+      if (startupDivergenceDetected && startupDivergenceError) {
+        return {
+          backend: "hermes",
+          active: false,
+          writable: false,
+          searchable: false,
+          scope,
+          database,
+          workingCount: entries.length,
+          episodicCount: db.sessions,
+          tripleCount: db.memories,
+          lastMemory: entries.at(-1),
+          message: `Hermes divergence: ${startupDivergenceError}`,
+          error: startupDivergenceError,
+          reviewEnabled,
+          flushEnabled,
+          reviewReason: lastReviewError ?? reviewReason,
+          flushReason: lastFlushError ?? flushReason,
+        };
+      }
+      // Surface last lifecycle errors as warnings even when active
+      const lifecycleSuffix = lastReviewError || lastFlushError ? ` · review/flush warnings` : "";
+      const err = lastReviewError ?? lastFlushError ?? undefined;
       return {
         backend: "hermes",
         active: true,
@@ -671,11 +917,12 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
         episodicCount: db.sessions,
         tripleCount: db.memories,
         lastMemory: entries.at(-1),
-        message: `Hermes active · ${entries.length} memory entries · ${db.memories} indexed memories`,
+        message: `Hermes active · ${entries.length} memory entries · ${db.memories} indexed memories${lifecycleSuffix}`,
+        error: err,
         reviewEnabled,
         flushEnabled,
-        reviewReason,
-        flushReason,
+        reviewReason: lastReviewError ?? reviewReason,
+        flushReason: lastFlushError ?? flushReason,
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -693,8 +940,8 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
         error: msg,
         reviewEnabled,
         flushEnabled,
-        reviewReason,
-        flushReason,
+        reviewReason: lastReviewError ?? reviewReason,
+        flushReason: lastFlushError ?? flushReason,
       };
     }
   }
@@ -736,12 +983,23 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
     const content = normalized.content.trim();
     if (!content) return { backend: "hermes", stored: 0, message: "Memory content is empty" };
     const target = normalized.context === "user" ? "user" : "memory";
+    // Snapshot existence before add to avoid removing pre-existing duplicate on rollback
+    const existedBefore = (() => {
+      const entries = target === "user" ? store.getUserEntries() : store.getMemoryEntries();
+      return entries.includes(content);
+    })();
     const result = await store.add(target, content);
     if (!result.success) return { backend: "hermes", stored: 0, message: result.error ?? "Memory write failed" };
+    const wasDuplicate = existedBefore && result.message?.includes("already exists");
+    const inserted = wasDuplicate === false;
+    // For duplicate that was already present, we still want to ensure DB touch succeeds,
+    // but rollback must NOT remove the original entry.
     if (!dbAvailable || !dbManager) {
-      try {
-        await store.remove(target, content);
-      } catch {}
+      if (inserted) {
+        try {
+          await store.remove(target, content);
+        } catch {}
+      }
       return {
         backend: "hermes",
         stored: 0,
@@ -750,11 +1008,20 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
     }
     try {
       const row = addMemory(dbManager, content, target, null, null, null, null, null);
+      // If this was a duplicate, store.add did not actually insert a new delimited entry
+      // (it returned success without adding). In that case we treat stored as 0 or 1
+      // consistently: hermes counts it as 0 stored (no new entry) but DB touched.
+      // Preserve original contract: duplicate returns stored 0 with message.
+      if (wasDuplicate) {
+        return { backend: "hermes", stored: 0, ids: [String(row.id)], message: result.message };
+      }
       return { backend: "hermes", stored: 1, ids: [String(row.id)], message: result.message };
     } catch (error) {
-      try {
-        await store.remove(target, content);
-      } catch {}
+      if (inserted) {
+        try {
+          await store.remove(target, content);
+        } catch {}
+      }
       const msg = error instanceof Error ? error.message : String(error);
       dbAvailable = false;
       dbError = msg;
@@ -797,12 +1064,19 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
 
   async function beforeAgentStartPrompt(_sessionArg?: unknown, _promptText?: string): Promise<string | undefined> {
     await ensureStarted();
-    return buildDeveloperInstructions();
+    // Stable memory is already injected via buildDeveloperInstructions on canonical prompt.
+    // beforeAgentStartPrompt is reserved for query-dependent ephemeral context only; returning
+    // the full stable block here would duplicate injection. Return undefined unless we have
+    // a genuinely query-dependent augmentation in the future.
+    return undefined;
   }
 
   async function preCompactionContext(messages?: unknown[], _settings?: unknown, _sessionArg?: unknown): Promise<string | undefined> {
     await ensureStarted();
-    // Attempt flush using supplied messages or recent buffer
+    // Flush any pending turn context before compaction; do not return the full stable
+    // memory block (already injected via buildDeveloperInstructions). Returning
+    // undefined avoids duplicate prompt augmentation — compaction's canonical logic
+    // retains the stable block via promotion snapshot.
     if (flushEnabled && exec) {
       if (Array.isArray(messages) && messages.length > 0) {
         // Build conversation from compaction messages
@@ -838,41 +1112,58 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
                 }
               } catch {}
               for (const entry of entries) {
+                const beforeSet = new Set(store.getMemoryEntries());
+                const existedBefore = beforeSet.has(entry);
                 try {
                   const res = await store.add("memory", entry);
                   if (!res.success) continue;
+                  const wasDuplicate = existedBefore && res.message?.includes("already exists");
+                  const inserted = wasDuplicate === false;
                   if (dbAvailable && dbManager) {
                     try {
                       addMemory(dbManager, entry, "memory", null, null, null, null, null);
                     } catch (e) {
-                      try {
-                        await store.remove("memory", entry);
-                      } catch {}
+                      if (inserted) {
+                        try {
+                          await store.remove("memory", entry);
+                        } catch {}
+                      }
                       dbAvailable = false;
                       dbError = e instanceof Error ? e.message : String(e);
                     }
                   } else {
-                    try {
-                      await store.remove("memory", entry);
-                    } catch {}
+                    if (inserted) {
+                      try {
+                        await store.remove("memory", entry);
+                      } catch {}
+                    }
                   }
                 } catch {}
               }
             }
-          } catch {}
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            lastFlushError = `preCompaction flush failed: ${msg}`;
+          }
         } else {
           // fallback to buffered flush
           try {
             await doFlush();
-          } catch {}
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            lastFlushError = `preCompaction buffered flush failed: ${msg}`;
+          }
         }
       } else {
         try {
           await doFlush();
-        } catch {}
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          lastFlushError = `preCompaction flush failed: ${msg}`;
+        }
       }
     }
-    return buildDeveloperInstructions();
+    return undefined;
   }
 
   async function dispose(): Promise<void> {
@@ -895,6 +1186,10 @@ export function createHermesMemoryBackend(options: HermesBackendRuntimeOptions =
       dbManager = null;
     }
     recentMessages = [];
+    lastReviewError = undefined;
+    lastFlushError = undefined;
+    startupDivergenceError = undefined;
+    startupDivergenceDetected = false;
   }
 
   return { start, buildDeveloperInstructions, clear, enqueue, status, search, save, stats, diagnose, beforeAgentStartPrompt, preCompactionContext, dispose };
