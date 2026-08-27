@@ -55,10 +55,10 @@ index 4eeef47..fcb27ad 100644
      name: Tests
 diff --git a/.github/workflows/sync-upstream.yml b/.github/workflows/sync-upstream.yml
 new file mode 100644
-index 0000000..9a43111
+index 0000000..1f17137
 --- /dev/null
 +++ b/.github/workflows/sync-upstream.yml
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,107 @@
 +name: Sync upstream
 +
 +on:
@@ -151,10 +151,13 @@ index 0000000..9a43111
 +          fi
 +          git config user.name "github-actions[bot]"
 +          git config user.email "github-actions[bot]@users.noreply.github.com"
-+          # provenance commit message includes upstream commit
++          # provenance commit message includes upstream commit and overlay commit
 +          upstream_sha=$(git rev-parse upstream/main)
++          overlay_sha=$(git rev-parse HEAD | cut -c1-7)
++          # Use current overlay commit from provenance (c7eed73) if HEAD not yet updated; fallback to HEAD short
++          prov_overlay=$(grep -E '^overlay_commit=' android/overlay/UPSTREAM | cut -d= -f2 || echo "$overlay_sha")
 +          git add -A
-+          git commit -m "chore(sync): mirror upstream ${upstream_sha} + overlay f20e315"
++          git commit -m "chore(sync): mirror upstream ${upstream_sha} + overlay ${prov_overlay}"
 +          git push origin HEAD:main
 +
 +      - name: Notify conflict
