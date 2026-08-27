@@ -2,11 +2,11 @@
 upstream_url=https://github.com/chandra447/pi-hermes-memory.git
 upstream_branch=main
 overlay_format=patch-v1+hermes-files-v1
-overlay_commit=d8d7196
+overlay_commit=0cf3fdc
 upstream_commit=5f6fa99cf4a8a500141f8ad5c12c14fd4cf3a1b5
 upstream_base=5f6fa99
 overlay_patch=android/overlay/hermes-fork.patch
 hermes_files=android/overlay/hermes-files
-generated_from=upstream/main..d8d7196
-overlay_version=7
+generated_from=upstream/main..0cf3fdc
+overlay_version=9
 hermes_files_count=19

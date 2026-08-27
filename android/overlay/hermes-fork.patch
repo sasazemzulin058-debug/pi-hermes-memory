@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 4eeef47..390ac86 100644
+index 4eeef47..7cfb48d 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -5,24 +5,31 @@ on:
@@ -44,9 +44,12 @@ index 4eeef47..390ac86 100644
      runs-on: ubuntu-latest
      steps:
        - uses: actions/checkout@v4
-@@ -33,10 +40,7 @@ jobs:
+@@ -31,12 +38,9 @@ jobs:
+         with:
+           node-version: 22
  
-       - run: npm install
+-      - run: npm install
++      - run: npm ci
  
 -      # The `check` job installs whatever the devDependency range resolves to,
 -      # which is always new enough to hide a broken peerDependencies floor.
@@ -56,6 +59,24 @@ index 4eeef47..390ac86 100644
  
    test:
      name: Tests
+@@ -49,7 +53,7 @@ jobs:
+         with:
+           node-version: 22
+ 
+-      - run: npm install
++      - run: npm ci
+ 
+       - run: npm test
+ 
+@@ -63,7 +67,7 @@ jobs:
+         with:
+           node-version: 22
+ 
+-      - run: npm install
++      - run: npm ci
+ 
+       - name: Check for uncommitted changes
+         run: git diff --exit-code
 diff --git a/.gitignore b/.gitignore
 index 8549031..25dddb5 100644
 --- a/.gitignore
