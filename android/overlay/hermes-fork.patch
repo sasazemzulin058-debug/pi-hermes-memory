@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 4eeef47..7cfb48d 100644
+index 4eeef47..ffc109a 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -5,24 +5,31 @@ on:
@@ -16,18 +16,16 @@ index 4eeef47..7cfb48d 100644
      runs-on: ubuntu-latest
      steps:
        - uses: actions/checkout@v4
--
--      - uses: actions/setup-node@v4
-         with:
--          node-version: 22
++        with:
 +          fetch-depth: 0
  
--      - run: npm install
+-      - uses: actions/setup-node@v4
 +      - uses: actions/setup-python@v5
-+        with:
+         with:
+-          node-version: 22
 +          python-version: '3.11'
  
--      - run: npm run check
+-      - run: npm install
 +      - name: Verify upstream provenance and overlay idempotence
 +        run: |
 +          python3 -m py_compile android/scripts/apply-upstream-overlay.py
@@ -37,6 +35,8 @@ index 4eeef47..7cfb48d 100644
 +          # If src/hermes-runtime.ts missing or package exports missing, verification would have failed above.
 +          # Also ensure second apply is no-op (verified inside verify script).
  
+-      - run: npm run check
+-
 -  min-sdk:
 -    name: Min Supported SDK
 +  check:
@@ -68,7 +68,7 @@ index 4eeef47..7cfb48d 100644
  
        - run: npm test
  
-@@ -63,7 +67,7 @@ jobs:
+@@ -63,7 +67,107 @@ jobs:
          with:
            node-version: 22
  
@@ -77,6 +77,106 @@ index 4eeef47..7cfb48d 100644
  
        - name: Check for uncommitted changes
          run: git diff --exit-code
++
++  android-native:
++    name: Build Android arm64 better-sqlite3 (Bionic)
++    runs-on: ubuntu-latest
++    timeout-minutes: 30
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Load Android manifest environment
++        run: |
++          set -euo pipefail
++          grep -v '^#' android/versions.env >> "$GITHUB_ENV"
++          cat android/versions.env
++
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 22
++
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.11'
++
++      - name: Install system dependencies
++        run: |
++          set -euo pipefail
++          sudo apt-get update
++          sudo apt-get install -y python3 make g++ file
++
++      - name: Install Android NDK
++        id: ndk
++        uses: nttld/setup-ndk@v1
++        with:
++          ndk-version: ${{ env.NDK_VERSION }}
++          add-to-path: false
++
++      - name: Install JS dependencies
++        run: npm ci
++
++      - name: Build better-sqlite3 for Android arm64 (NDK clang)
++        env:
++          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
++        run: |
++          set -euo pipefail
++          echo "NDK path: $ANDROID_NDK_ROOT"
++          ls -la "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang" || true
++          bash android/scripts/build-better-sqlite3-android.sh
++
++      - name: Verify Android arm64 artifact (fail-closed)
++        run: |
++          set -euo pipefail
++          ADDON="node_modules/better-sqlite3/build/Release/better_sqlite3.node"
++          STAGE="android/build/better_sqlite3.node"
++          echo "=== Verifying $ADDON ==="
++          test -s "$ADDON"
++          test -s "$STAGE"
++          test -s "android/build/better_sqlite3.node.sha256"
++          test -s "android/build/better_sqlite3.metadata.json"
++          file "$ADDON" | tee /tmp/addon.file
++          cat /tmp/addon.file
++          grep -q "aarch64" /tmp/addon.file || { echo "::error::addon not aarch64"; cat /tmp/addon.file; exit 1; }
++          grep -q "Android" /tmp/addon.file || { echo "::error::addon not Android/Bionic"; cat /tmp/addon.file; exit 1; }
++          grep -q "shared object" /tmp/addon.file || { echo "::error::addon not shared object"; cat /tmp/addon.file; exit 1; }
++          if grep -q "GNU/Linux" /tmp/addon.file && ! grep -q "Android" /tmp/addon.file; then
++            echo "::error::addon is GNU/Linux (glibc) not Android/Bionic"
++            exit 1
++          fi
++          echo "=== readelf check ==="
++          if [ -x "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" ]; then
++            "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$ADDON" | tee /tmp/readelf.txt
++            grep -q "Machine:.*AArch64" /tmp/readelf.txt || { echo "::error::readelf Machine not AArch64"; cat /tmp/readelf.txt; exit 1; }
++            grep -q "Class:.*ELF64" /tmp/readelf.txt || { echo "::error::ELF Class not ELF64"; cat /tmp/readelf.txt; exit 1; }
++          elif command -v readelf >/dev/null 2>&1; then
++            readelf -h "$ADDON" | tee /tmp/readelf.txt
++            grep -q "Machine:.*AArch64" /tmp/readelf.txt || { echo "::error::readelf Machine not AArch64"; cat /tmp/readelf.txt; exit 1; }
++          else
++            echo "warning: no readelf available, skipping Machine check"
++          fi
++          echo "=== checksum ==="
++          (cd android/build && sha256sum -c better_sqlite3.node.sha256)
++          cat android/build/better_sqlite3.node.sha256
++          echo "=== metadata ==="
++          cat android/build/better_sqlite3.metadata.json
++          # Ensure metadata documents exact install path
++          grep -q "node_modules/better-sqlite3/build/Release/better_sqlite3.node" android/build/better_sqlite3.metadata.json || { echo "::error::metadata missing exact install path"; exit 1; }
++          grep -q "android_api" android/build/better_sqlite3.metadata.json || { echo "::error::metadata missing android_api"; exit 1; }
++          grep -q "ndk_version" android/build/better_sqlite3.metadata.json || { echo "::error::metadata missing ndk_version"; exit 1; }
++          grep -q "aarch64" android/build/better_sqlite3.metadata.json || { echo "::error::metadata missing arch"; exit 1; }
++          echo "✅ Android arm64 artifact verified"
++
++      - name: Upload Android arm64 artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: better-sqlite3-android-arm64
++          path: |
++            android/build/better_sqlite3.node
++            android/build/better_sqlite3.android-arm64.node
++            android/build/better_sqlite3.node.sha256
++            android/build/better_sqlite3.android-arm64.node.sha256
++            android/build/better_sqlite3.metadata.json
++          if-no-files-found: error
 diff --git a/.gitignore b/.gitignore
 index 8549031..25dddb5 100644
 --- a/.gitignore
