@@ -145,75 +145,48 @@ if [ -x "$NDK_STRIP" ]; then
 fi
 
 # === Fail-closed verification ===
-# Must be ELF 64-bit LSB shared object, ARM aarch64, for Android/Bionic
+# `file(1)` reports architecture/type; Android/Bionic identity comes from
+# NDK readelf dependencies because some file versions omit the Android label.
 file_type="$(file -b "$ADDON")"
 echo "==> Built: $ADDON"
 echo "    $file_type"
-
-# Strict Android/Bionic checks — fail closed if not matching
 case "$file_type" in
-  *ELF*64-bit*LSB*shared*object*ARM*aarch64*Android*)
-    echo "    OK: file(1) reports ELF aarch64 Android shared object"
-    ;;
-  *ELF*ARM*aarch64*Android*|*ELF*aarch64*Android*)
-    echo "    OK: file(1) reports ELF aarch64 Android"
+  *ELF*64-bit*LSB*shared*object*ARM*aarch64*|*ELF*64-bit*LSB*shared*object*aarch64*)
+    echo "    OK: file(1) reports ELF64 aarch64 shared object"
     ;;
   *)
-    echo "error: addon is not Android aarch64 ELF shared object" >&2
+    echo "error: addon is not ELF64 aarch64 shared object" >&2
     echo "  got: $file_type" >&2
-    echo "  expected pattern: ELF 64-bit LSB shared object, ARM aarch64, for Android ${ANDROID_API}, built by NDK" >&2
     exit 1
     ;;
 esac
 
-# Additional fail-closed checks via file substrings
-if ! echo "$file_type" | grep -q "aarch64"; then
-  echo "error: file output missing aarch64: $file_type" >&2
+if echo "$file_type" | grep -q "GNU/Linux"; then
+  echo "error: addon appears to be GNU/Linux (glibc), not Android/Bionic: $file_type" >&2
   exit 1
 fi
-if ! echo "$file_type" | grep -q "Android"; then
-  echo "error: file output missing Android/Bionic marker: $file_type" >&2
-  exit 1
-fi
-if ! echo "$file_type" | grep -q "shared object"; then
-  echo "error: file output missing shared object marker: $file_type" >&2
-  exit 1
-fi
-# Reject linux-arm64 (glibc) masquerading as Android — must NOT contain "GNU/Linux" without Android
-if echo "$file_type" | grep -q "GNU/Linux" && ! echo "$file_type" | grep -q "Android"; then
-  echo "error: addon appears to be GNU/Linux (glibc) not Android/Bionic: $file_type" >&2
-  exit 1
-fi
+echo "$file_type" | grep -q "aarch64" || { echo "error: file output missing aarch64: $file_type" >&2; exit 1; }
+echo "$file_type" | grep -q "shared object" || { echo "error: file output missing shared object: $file_type" >&2; exit 1; }
 
-# readelf Machine check — ensures EM_AARCH64 (183) and not EM_X86_64 etc.
+# readelf Machine/Class and Android's Bionic-linked libraries are mandatory.
 READELF_BIN=""
-if [ -x "$NDK_READELF" ]; then
-  READELF_BIN="$NDK_READELF"
-elif command -v llvm-readelf >/dev/null 2>&1; then
-  READELF_BIN="llvm-readelf"
-elif command -v readelf >/dev/null 2>&1; then
-  READELF_BIN="readelf"
+if [ -x "$NDK_READELF" ]; then READELF_BIN="$NDK_READELF"; elif command -v llvm-readelf >/dev/null 2>&1; then READELF_BIN="llvm-readelf"; fi
+if [ -z "$READELF_BIN" ]; then
+  echo "error: llvm-readelf required for Android/Bionic verification" >&2
+  exit 1
 fi
-if [ -n "$READELF_BIN" ]; then
-  echo "    readelf ($READELF_BIN) header:"
-  READELF_OUT="$("$READELF_BIN" -h "$ADDON" 2>&1 | head -n 30)"
-  echo "$READELF_OUT"
-  if ! echo "$READELF_OUT" | grep -q "Machine:.*AArch64"; then
-    echo "error: readelf Machine is not AArch64" >&2
-    echo "$READELF_OUT" >&2
-    exit 1
-  fi
-  # ELF class must be 64-bit
-  if ! echo "$READELF_OUT" | grep -q "Class:.*ELF64"; then
-    echo "error: ELF Class is not ELF64" >&2
-    exit 1
-  fi
-  echo "    OK: readelf confirms AArch64 ELF64"
-else
-  echo "warning: no readelf found — skipping Machine check (file(1) already verified)" >&2
-fi
+READELF_OUT="$("$READELF_BIN" -h "$ADDON" 2>&1)"
+echo "$READELF_OUT"
+echo "$READELF_OUT" | grep -q "Machine:.*AArch64" || { echo "error: readelf Machine is not AArch64" >&2; exit 1; }
+echo "$READELF_OUT" | grep -q "Class:.*ELF64" || { echo "error: ELF Class is not ELF64" >&2; exit 1; }
+DEPS="$("$READELF_BIN" -d "$ADDON" 2>&1)"
+echo "$DEPS"
+echo "$DEPS" | grep -q 'Shared library: \[libc.so\]' || { echo "error: addon lacks Android libc.so dependency" >&2; exit 1; }
+echo "$DEPS" | grep -q 'Shared library: \[liblog.so\]' || { echo "error: addon lacks Android liblog.so dependency" >&2; exit 1; }
+echo "    OK: readelf confirms Android/Bionic ELF64 AArch64 addon"
 
-# === Package artifact with checksum and metadata ===
+ # === Package artifact with checksum and metadata ===
+
 STAGE_DIR="android/build"
 mkdir -p "$STAGE_DIR"
 

@@ -129,25 +129,22 @@ jobs:
           test -s "android/build/better_sqlite3.node.sha256"
           test -s "android/build/better_sqlite3.metadata.json"
           file "$ADDON" | tee /tmp/addon.file
-          cat /tmp/addon.file
           grep -q "aarch64" /tmp/addon.file || { echo "::error::addon not aarch64"; cat /tmp/addon.file; exit 1; }
-          grep -q "Android" /tmp/addon.file || { echo "::error::addon not Android/Bionic"; cat /tmp/addon.file; exit 1; }
           grep -q "shared object" /tmp/addon.file || { echo "::error::addon not shared object"; cat /tmp/addon.file; exit 1; }
-          if grep -q "GNU/Linux" /tmp/addon.file && ! grep -q "Android" /tmp/addon.file; then
-            echo "::error::addon is GNU/Linux (glibc) not Android/Bionic"
+          if grep -q "GNU/Linux" /tmp/addon.file; then
+            echo "::error::addon is GNU/Linux (glibc), not Android/Bionic"
             exit 1
           fi
           echo "=== readelf check ==="
-          if [ -x "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" ]; then
-            "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$ADDON" | tee /tmp/readelf.txt
-            grep -q "Machine:.*AArch64" /tmp/readelf.txt || { echo "::error::readelf Machine not AArch64"; cat /tmp/readelf.txt; exit 1; }
-            grep -q "Class:.*ELF64" /tmp/readelf.txt || { echo "::error::ELF Class not ELF64"; cat /tmp/readelf.txt; exit 1; }
-          elif command -v readelf >/dev/null 2>&1; then
-            readelf -h "$ADDON" | tee /tmp/readelf.txt
-            grep -q "Machine:.*AArch64" /tmp/readelf.txt || { echo "::error::readelf Machine not AArch64"; cat /tmp/readelf.txt; exit 1; }
-          else
-            echo "warning: no readelf available, skipping Machine check"
-          fi
+          READELF="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          test -x "$READELF" || { echo "::error::Android NDK llvm-readelf missing"; exit 1; }
+          "$READELF" -h "$ADDON" | tee /tmp/readelf.txt
+          grep -q "Machine:.*AArch64" /tmp/readelf.txt || { echo "::error::readelf Machine not AArch64"; exit 1; }
+          grep -q "Class:.*ELF64" /tmp/readelf.txt || { echo "::error::ELF Class not ELF64"; exit 1; }
+          "$READELF" -d "$ADDON" | tee /tmp/dynamic.txt
+          grep -q 'Shared library: \[libc.so\]' /tmp/dynamic.txt || { echo "::error::missing Android libc.so"; exit 1; }
+          grep -q 'Shared library: \[liblog.so\]' /tmp/dynamic.txt || { echo "::error::missing Android liblog.so"; exit 1; }
+          echo "OK: Android/Bionic ELF64 AArch64 addon"
           echo "=== checksum ==="
           (cd android/build && sha256sum -c better_sqlite3.node.sha256)
           cat android/build/better_sqlite3.node.sha256
