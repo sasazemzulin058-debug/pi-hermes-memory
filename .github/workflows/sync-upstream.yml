@@ -21,31 +21,35 @@ jobs:
 
       - name: Fetch upstream
         run: |
+          set -euo pipefail
           git remote add upstream https://github.com/chandra447/pi-hermes-memory.git || git remote set-url upstream https://github.com/chandra447/pi-hermes-memory.git
           git fetch upstream main --prune
 
-      - name: Import upstream tree (preserve .github, android, install script)
+      - name: Import upstream tree (preserve android and caches)
         run: |
-          set -e
-          # Archive upstream main to temp and rsync excluding overlay scaffolding
+          set -euo pipefail
+          # Archive upstream main to temp and rsync excluding only fork-owned scaffolding
           tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
           git archive upstream/main | tar -x -C "$tmp"
-          # rsync upstream into working tree, preserving fork-owned scaffolding
+          # rsync upstream into working tree, preserving only fork-owned scaffolding
+          # Keep .git (git metadata), android (overlay patch + scripts), and runtime caches
+          # All other paths including .github and install-android.sh are replaced from upstream
+          # so that overlay patch (which owns those fork-specific paths) can re-apply them cleanly
           rsync -a --delete \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='android' \
-            --exclude='install-android.sh' \
-            --exclude='node_modules' \
-            --exclude='.pi' \
+            --exclude='.git/' \
+            --exclude='android/' \
+            --exclude='node_modules/' \
+            --exclude='.pi/' \
             "$tmp"/ ./
-          rm -rf "$tmp"
+          # Sync index to match upstream working tree for clean `git apply --3way`
+          git add -A
           echo "import done"
-          git status --porcelain | head -n 50
+          git status --porcelain | head -n 100
 
       - name: Apply overlay
         run: |
-          set -e
+          set -euo pipefail
           python3 android/scripts/apply-upstream-overlay.py
           python3 android/scripts/verify-upstream-overlay.py
 
@@ -56,24 +60,30 @@ jobs:
 
       - name: Install (lockfile-consistent)
         run: |
+          set -euo pipefail
           if [ -f package-lock.json ]; then npm ci || npm install; else npm install; fi
 
       - name: Type check
-        run: npm run check
+        run: |
+          set -euo pipefail
+          npm run check
 
       - name: Tests (full or focused per upstream CI)
         run: |
+          set -euo pipefail
           # Upstream CI runs npm test via tests/run-all.sh ; respect TEST_TIMEOUT if set
           npm test
 
       - name: Verify overlay idempotence
         run: |
+          set -euo pipefail
           python3 android/scripts/apply-upstream-overlay.py
           python3 android/scripts/verify-upstream-overlay.py
 
+
       - name: Commit & push if changed
         run: |
-          set -e
+          set -euo pipefail
           if git diff --quiet && git diff --cached --quiet; then
             echo "no changes to commit"
             exit 0
@@ -89,5 +99,6 @@ jobs:
       - name: Notify conflict
         if: failure()
         run: |
+          set -euo pipefail
           echo "::error::Sync failed — overlay patch conflict or upstream incompatibility. Check android/overlay/hermes-fork.patch and provenance."
           echo "Upstream may have changed files touched by overlay; manual rebase of android/overlay/hermes-fork.patch required."
